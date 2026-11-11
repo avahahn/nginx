@@ -31,6 +31,9 @@ typedef struct {
     ngx_uint_t    index;
     ngx_uint_t    state;
 
+    ssize_t       timeout;
+
+    ngx_str_t     param_name, param_value;
     ngx_str_t     path;
     ngx_uint_t    method;
 
@@ -68,6 +71,7 @@ static void ngx_control_log_capture(ngx_log_t *log, ngx_uint_t l,
     u_char *buf, size_t len);
 
 static ngx_int_t ngx_control_parse_request_line(ngx_control_request_t *r);
+static void ngx_control_parse_uri_param(ngx_control_request_t *r);
 static ngx_int_t ngx_control_send_json(ngx_control_request_t *r, ngx_int_t code,
     ngx_data_item_t *obj);
 
@@ -1054,6 +1058,49 @@ ngx_control_log_capture(ngx_log_t *log, ngx_uint_t lvl, u_char *buf, size_t len)
 }
 
 
+static void
+ngx_control_parse_uri_param(ngx_control_request_t *r)
+{
+    u_char  *name, *value;
+
+    name = ngx_pcalloc(r->pool, r->param_name.len + 1);
+    value = ngx_pcalloc(r->pool, r->param_value.len + 1);
+    if (name == NULL || value == NULL) {
+        return;
+    }
+
+    ngx_cpystrn(name, r->param_name.data, r->param_name.len + 1);
+    ngx_cpystrn(value, r->param_value.data, r->param_value.len + 1);
+
+    /* No need for a defaut behavior, we can ignore parameters we dont
+     * know about without rejecting request processing. Additionally,
+     * dont bother returning error from this function when we can possibly
+     * run the request anyways.
+     */
+
+    switch (r->param_name.len) {
+    case 7:
+        if (ngx_strncmp("timeout", name, r->param_value.len)) {
+            r->timeout = ngx_atosz(value, r->param_value.len);
+            if (r->timeout == NGX_ERROR) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                        "control: bad value for request timeout: %s", value);
+                return;
+            }
+        }
+
+        break;
+
+    default:
+        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                      "control: unknown request parameter: %s", name);
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, ngx_cycle->log, 0,
+                   "control: request parameter %s=%s", name, value);
+}
+
+
 static ngx_int_t
 ngx_control_parse_request_line(ngx_control_request_t *r)
 {
@@ -1088,6 +1135,8 @@ ngx_control_parse_request_line(ngx_control_request_t *r)
         sw_port_start,
         sw_port,
         sw_uri,
+        sw_uri_param_name,
+        sw_uri_param_value,
         sw_http_,
         sw_http_H,
         sw_http_HT,
@@ -1242,7 +1291,7 @@ ngx_control_parse_request_line(ngx_control_request_t *r)
             /* empty path cases */
             case '?':
                 ngx_str_set(&r->path, "/");
-                state = sw_uri;
+                state = sw_uri_param_name;
                 break;
             case ' ':
                 ngx_str_set(&r->path, "/");
@@ -1315,7 +1364,7 @@ ngx_control_parse_request_line(ngx_control_request_t *r)
             /* empty path cases */
             case '?':
                 ngx_str_set(&r->path, "/");
-                state = sw_uri;
+                state = sw_uri_param_name;
                 break;
             case ' ':
                 ngx_str_set(&r->path, "/");
@@ -1340,6 +1389,9 @@ ngx_control_parse_request_line(ngx_control_request_t *r)
                 if (r->path.len == 0) {
                     r->path.len = p - r->path.data;
                 }
+                if (state == sw_uri) {
+                    state = sw_uri_param_name;
+                }
                 break;
 
             case '.':
@@ -1353,6 +1405,61 @@ ngx_control_parse_request_line(ngx_control_request_t *r)
                     return NGX_DECLINED;
                 }
                 break;
+            }
+            break;
+
+        /* query param name */
+        case sw_uri_param_name:
+            if (r->param_name.data == NULL) {
+                r->param_name.data = p;
+            }
+
+            if (ch == '=') {
+                r->param_name.len = p - r->param_name.data;
+                if (r->param_name.len < 1) {
+                    return NGX_DECLINED;
+                }
+                state = sw_uri_param_value;
+                break;
+            }
+
+            if (isalnum(ch) || ch == '-' || ch == '_') {
+                break;
+            }
+
+            return NGX_DECLINED;
+
+        /* query param value */
+        case sw_uri_param_value:
+            if (r->param_value.data == NULL) {
+                r->param_value.data = p;
+            }
+
+            switch (ch) {
+            case ' ':
+                state = sw_http_;
+                /* fallthrough */
+
+            case '&':
+                if (state == sw_uri_param_value) {
+                    state = sw_uri_param_name;
+                }
+
+                r->param_value.len = p - r->param_value.data;
+                if (r->param_value.len < 1) {
+                    return NGX_DECLINED;
+                }
+
+                ngx_control_parse_uri_param(r);
+                break;
+
+            case '#':
+            default:
+                if (isalnum(ch) || ch == '-' || ch == '_') {
+                    break;
+                }
+
+                return NGX_DECLINED;
             }
             break;
 
